@@ -10,52 +10,30 @@
 - **Connection Pooling** — переиспользование TCP-соединений через httputil.ReverseProxy
 - **Таймауты** — Read/Write/Idle таймауты на все соединения
 
-## Производительность
+## Быстрый старт
 
-### Нагрузочное тестирование
-
-Инструмент: `hey`  
-Команда: `hey -n 20000 -c 200 http://127.0.0.1:8080`
-
-```text
-Summary:
-  Total:        1.2342 secs
-  Slowest:      0.0847 secs
-  Fastest:      0.0002 secs
-  Average:      0.0049 secs
-  Requests/sec: 16214.67
-
-Status code distribution:
-  [200] 20000 responses
-Результат: 16 214 RPS (запросов в секунду) при нагрузке 200 конкурентных соединений.
+```bash
+go run main.go backends.go
 ```
-
-Быстрый старт
-Запуск балансировщика
-```
-go run main.go
-```
-Балансировщик запустится на http://127.0.0.1:8080 и начнет распределять трафик между тремя бэкендами на портах 8081, 8082, 8083.
+Балансировщик запустится на http://127.0.0.1:8080 и начнет распределять трафик между тремя бэкендами.
 
 Проверка работы
 ```
 curl http://127.0.0.1:8080
 ```
-# Backend 1 response
+# backend port 8081
 ```
 curl http://127.0.0.1:8080
 ```
-# Backend 2 response
+# backend port 8082
 ```
 curl http://127.0.0.1:8080
 ```
-# Backend 3 response
-Стресс-тест
-```
-go install github.com/rakyll/hey@latest
-hey -n 20000 -c 200 http://127.0.0.1:8080
-```
+# backend port 8083
+При каждом запросе порт меняется по кругу.
+
 Архитектура
+
 ```
 Client
   │ (HTTP)
@@ -95,25 +73,10 @@ func (p *Pool) healthCheck() {
     }
 }
 ```
-Конфигурация
-Отредактируй main.go и измени список серверов:
+Файлы проекта
 ```
-addrs := []string{
-    "http://127.0.0.1:8081",
-    "http://127.0.0.1:8082",
-    "http://127.0.0.1:8083",
-}
-```
-Требования
-```
-Go 1.20+
-```
-Технологии
-```
-Язык: Go
-Networking: net, net/http, httputil
-Concurrency: goroutines, sync/atomic
-I/O: Асинхронное, без блокировок
+├── main.go       — Балансировщик, healthCheck, Round Robin логика
+└── backends.go   — Три тестовых HTTP-сервера на портах 8081-8083
 ```
 Инженерные решения
 1. Атомарный счетчик вместо мьютекса
@@ -124,3 +87,17 @@ I/O: Асинхронное, без блокировок
 
 3. Connection Pooling через ReverseProxy
 Стандартная библиотека httputil.ReverseProxy управляет пулом соединений и Keep-Alive автоматически.
+
+4. Auto Failover без рестарта
+Если сервер падает, Health Check автоматически помечает его как DOWN. Следующий запрос уйдет на живой сервер. Пользователь ничего не заметит.
+
+Требования
+```
+Go 1.20+
+```
+Технологии
+```
+Язык: Go
+Networking: net, net/http, httputil
+Concurrency: goroutines, sync/atomic
+I/O: Асинхронное, без блокировок
