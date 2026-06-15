@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"os/signal"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -22,8 +27,13 @@ type Pool struct {
 }
 
 func (p *Pool) next() *Backend {
-	n := p.current.Add(1)
 	l := uint32(len(p.backends))
+	if l == 0 {
+		return nil
+	}
+
+	n := p.current.Add(1)
+
 	for i := uint32(0); i < l; i++ {
 		b := p.backends[(n+i)%l]
 		if b.alive.Load() {
@@ -36,32 +46,46 @@ func (p *Pool) next() *Backend {
 func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b := p.next()
 	if b == nil {
-		http.Error(w, "503 Service Unavailable", http.StatusServiceUnavailable)
+		http.Error(w, "503 Service Unavailable (All backends are down)", http.StatusServiceUnavailable)
 		return
 	}
 	b.proxy.ServeHTTP(w, r)
 }
 
-func (p *Pool) healthCheck() {
-	t := time.NewTicker(5 * time.Second)
-	for range t.C {
-		for _, b := range p.backends {
-			conn, err := net.DialTimeout("tcp", b.url.Host, 2*time.Second)
-			alive := err == nil
-			b.alive.Store(alive)
-			if alive {
-				conn.Close()
+func (p *Pool) healthCheck(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			for _, b := range p.backends {
+				conn, err := net.DialTimeout("tcp", b.url.Host, 2*time.Second)
+				alive := err == nil
+				
+				b.alive.Store(alive)
+				if alive {
+					conn.Close()
+				}
+
+				status := "UP"
+				if !alive {
+					status = "DOWN"
+				}
+				log.Printf("[HEALTH] %s is %s", b.url.Host, status)
 			}
-			status := "UP"
-			if !alive {
-				status = "DOWN"
-			}
-			log.Printf("health %s [%s]", b.url.Host, status)
+		case <-ctx.Done():
+			log.Println("[HEALTH] Background health check stopped")
+			return
 		}
 	}
 }
 
 func main() {
+	log.Println("[SYSTEM] Starting L7 Load Balancer infrastructure...")
+
+	StartTestBackends()
+
 	addrs := []string{
 		"http://127.0.0.1:8081",
 		"http://127.0.0.1:8082",
@@ -73,12 +97,13 @@ func main() {
 	for _, addr := range addrs {
 		u, err := url.Parse(addr)
 		if err != nil {
-			log.Fatalf("invalid url %s: %v", addr, err)
+			log.Fatalf("[FATAL] Invalid target URL %s: %v", addr, err)
 		}
 
 		proxy := httputil.NewSingleHostReverseProxy(u)
+		
 		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("upstream %s error: %v", u.Host, err)
+			log.Printf("[PROXY ERROR] Upstream %s failed: %v", u.Host, err)
 			http.Error(w, "502 Bad Gateway", http.StatusBadGateway)
 		}
 
@@ -87,7 +112,10 @@ func main() {
 		pool.backends = append(pool.backends, b)
 	}
 
-	go pool.healthCheck()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go pool.healthCheck(ctx)
 
 	srv := &http.Server{
 		Addr:         "127.0.0.1:8080",
@@ -97,8 +125,26 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	log.Printf("balancer listening on %s", srv.Addr)
-	if err := srv.ListenAndServe(); err != nil {
-		log.Fatalf("server error: %v", err)
+	go func() {
+		stop := make(chan os.Signal, 1)
+		signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+		<-stop
+		
+		log.Println("[SYSTEM] Shutting down gracefully...")
+		cancel()
+
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[ERROR] Server forced to shutdown: %v", err)
+		}
+	}()
+
+	log.Printf("[SYSTEM] Balancer is core-ready and listening on %s", srv.Addr)
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		log.Fatalf("[FATAL] Server error: %v", err)
 	}
+	
+	log.Println("[SYSTEM] Balancer successfully stopped.")
 }
